@@ -364,6 +364,16 @@ Region:  ${env.AWS_DEFAULT_REGION}""",
             echo "[BOOTSTRAP] Updating kubeconfig..."
             aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION}
 
+            # Self-heal kubectl if missing (fallback for old AMI)
+            if ! command -v kubectl &>/dev/null; then
+              echo "[BOOTSTRAP] kubectl missing — installing..."
+              curl -fsSL "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl" -o /tmp/kubectl
+              install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+              ln -sf /usr/local/bin/kubectl /usr/bin/kubectl
+              rm -f /tmp/kubectl
+              echo "[BOOTSTRAP] ✔ kubectl ready"
+            fi
+
             echo "[BOOTSTRAP] Waiting for nodes to be Ready..."
             kubectl wait --for=condition=Ready nodes --all --timeout=300s || true
 
