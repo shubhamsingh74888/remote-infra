@@ -26,6 +26,7 @@ pipeline {
     BACKEND_CONFIG     = "backend-configs/${params.ENVIRONMENT}.hcl"
     INFRA_REPO         = "${params.INFRA_REPO_URL}"
     PROJECT_REPO       = "${params.PROJECT_REPO_URL}"
+    PATH               = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${env.PATH}"
   }
 
   options {
@@ -90,15 +91,16 @@ pipeline {
           git branch: 'main', credentialsId: 'github', url: "${env.INFRA_REPO}"
 
           sh '''
+            export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
             ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
             echo "[REMOTE-INFRA] Running in AWS Account: $ACCOUNT_ID | Region: $AWS_DEFAULT_REGION"
             echo "[REMOTE-INFRA] Initialising remote backend infrastructure..."
-            
+
             terraform init
             terraform workspace select ${ENV_NAME} || terraform workspace new ${ENV_NAME}
             terraform plan  -out=remote-infra.tfplan
             terraform apply -auto-approve remote-infra.tfplan
-            
+
             echo "[REMOTE-INFRA] ✔ S3 bucket + DynamoDB ready."
           '''
         }
@@ -123,6 +125,7 @@ pipeline {
         )]) {
           dir('terraform') {
             sh '''
+              export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
               echo "[INIT] Initialising Terraform with backend: ${BACKEND_CONFIG}..."
               terraform init \
                 -backend-config=${BACKEND_CONFIG} \
@@ -145,6 +148,7 @@ pipeline {
         )]) {
           dir('terraform') {
             sh '''
+              export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
               rm -f tfplan
 
               # Define dynamic resource names based on environment
@@ -264,6 +268,7 @@ Region:  ${env.AWS_DEFAULT_REGION}""",
         )]) {
           dir('terraform') {
             sh '''
+              export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
               rm -f /tmp/plan-summary.txt
               if [ ! -f tfplan ]; then
                 echo "[APPLY] ✘ tfplan not found — re-run from Stage 03."
@@ -291,9 +296,12 @@ Region:  ${env.AWS_DEFAULT_REGION}""",
           passwordVariable: 'AWS_SECRET_ACCESS_KEY'
         )]) {
           sh '''
+            export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
+            echo "[CLEANUP] Cleaning up before destroy..."
             aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION} 2>/dev/null || true
             kubectl delete application --all -n argocd --timeout=60s 2>/dev/null || true
             kubectl delete svc -n wanderlust --field-selector spec.type=LoadBalancer --timeout=120s 2>/dev/null || true
+            echo "[CLEANUP] ✔ Pre-destroy cleanup complete."
             sleep 30
           '''
         }
@@ -313,8 +321,10 @@ Region:  ${env.AWS_DEFAULT_REGION}""",
         )]) {
           dir('terraform') {
             sh '''
+              export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
               echo "[DESTROY] ⚠ Destroying ${ENV_NAME} infrastructure..."
               terraform destroy -var-file="${TF_VAR_FILE}" -auto-approve
+              echo "[DESTROY] ✔ Infrastructure destroyed."
             '''
           }
         }
@@ -336,14 +346,32 @@ Region:  ${env.AWS_DEFAULT_REGION}""",
           passwordVariable: 'AWS_SECRET_ACCESS_KEY'
         )]) {
           sh '''
-            STATUS=$(aws eks describe-cluster --name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION} --query 'cluster.status' --output text 2>/dev/null || echo "NOT_FOUND")
-            if [ "$STATUS" != "ACTIVE" ]; then exit 0; fi
+            export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
+            echo "[BOOTSTRAP] Checking EKS cluster status..."
 
+            STATUS=$(aws eks describe-cluster \
+              --name ${CLUSTER_NAME} \
+              --region ${AWS_DEFAULT_REGION} \
+              --query 'cluster.status' \
+              --output text 2>/dev/null || echo "NOT_FOUND")
+
+            echo "[BOOTSTRAP] Cluster status: $STATUS"
+            if [ "$STATUS" != "ACTIVE" ]; then
+              echo "[BOOTSTRAP] ⚠ Cluster not ACTIVE — skipping bootstrap."
+              exit 0
+            fi
+
+            echo "[BOOTSTRAP] Updating kubeconfig..."
             aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION}
+
+            echo "[BOOTSTRAP] Waiting for nodes to be Ready..."
             kubectl wait --for=condition=Ready nodes --all --timeout=300s || true
-            
+
+            echo "[BOOTSTRAP] Running GitOps bootstrap script..."
             chmod +x bootstrap-gitops.sh
             ./bootstrap-gitops.sh
+
+            echo "[BOOTSTRAP] ✔ ArgoCD + GitOps bootstrap complete."
           '''
         }
       }
@@ -361,14 +389,39 @@ Region:  ${env.AWS_DEFAULT_REGION}""",
           passwordVariable: 'AWS_SECRET_ACCESS_KEY'
         )]) {
           sh '''
-            aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION} 2>/dev/null || true
-            NODEGROUP=$(aws eks list-nodegroups --cluster-name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION} --query 'nodegroups[0]' --output text 2>/dev/null || echo "")
+            export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
+            echo "[SCALE] Checking node count..."
+
+            aws eks update-kubeconfig \
+              --name ${CLUSTER_NAME} \
+              --region ${AWS_DEFAULT_REGION} 2>/dev/null || true
+
+            NODEGROUP=$(aws eks list-nodegroups \
+              --cluster-name ${CLUSTER_NAME} \
+              --region ${AWS_DEFAULT_REGION} \
+              --query 'nodegroups[0]' \
+              --output text 2>/dev/null || echo "")
 
             if [ -n "$NODEGROUP" ] && [ "$NODEGROUP" != "None" ]; then
-              CURRENT_DESIRED=$(aws eks describe-nodegroup --cluster-name ${CLUSTER_NAME} --nodegroup-name "$NODEGROUP" --region ${AWS_DEFAULT_REGION} --query 'nodegroup.scalingConfig.desiredSize' --output text 2>/dev/null || echo "0")
+              CURRENT_DESIRED=$(aws eks describe-nodegroup \
+                --cluster-name ${CLUSTER_NAME} \
+                --nodegroup-name "$NODEGROUP" \
+                --region ${AWS_DEFAULT_REGION} \
+                --query 'nodegroup.scalingConfig.desiredSize' \
+                --output text 2>/dev/null || echo "0")
+
+              echo "[SCALE] Current desired nodes: $CURRENT_DESIRED"
+
               if [ "$CURRENT_DESIRED" -lt 2 ]; then
-                aws eks update-nodegroup-config --cluster-name ${CLUSTER_NAME} --nodegroup-name "$NODEGROUP" --scaling-config minSize=1,maxSize=3,desiredSize=2 --region ${AWS_DEFAULT_REGION} 2>/dev/null || true
+                echo "[SCALE] Scaling up to 2 nodes..."
+                aws eks update-nodegroup-config \
+                  --cluster-name ${CLUSTER_NAME} \
+                  --nodegroup-name "$NODEGROUP" \
+                  --scaling-config minSize=1,maxSize=3,desiredSize=2 \
+                  --region ${AWS_DEFAULT_REGION} 2>/dev/null || true
                 kubectl wait --for=condition=Ready nodes --all --timeout=300s || true
+              else
+                echo "[SCALE] ✔ Already have $CURRENT_DESIRED nodes — no scaling needed."
               fi
             fi
           '''
@@ -388,20 +441,34 @@ Region:  ${env.AWS_DEFAULT_REGION}""",
           passwordVariable: 'AWS_SECRET_ACCESS_KEY'
         )]) {
           sh '''
+            export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
+
+            aws eks update-kubeconfig \
+              --name ${CLUSTER_NAME} \
+              --region ${AWS_DEFAULT_REGION} 2>/dev/null || true
+
+            ARGOCD_LB=$(kubectl get svc argocd-server -n argocd \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' \
+              2>/dev/null || echo "Pending")
+
+            JENKINS_IP=$(aws ec2 describe-addresses \
+              --filters "Name=tag:Name,Values=wanderlust-${ENV_NAME}-cicd-eip" \
+              --query 'Addresses[0].PublicIp' \
+              --output text \
+              --region ${AWS_DEFAULT_REGION} 2>/dev/null || echo "Not found")
+
             echo ""
             echo "╔══════════════════════════════════════════════════════╗"
             echo "║         WANDERLUST INFRA — DEPLOYMENT SUMMARY        ║"
             echo "╚══════════════════════════════════════════════════════╝"
             echo ""
-            echo "Environment: ${ENV_NAME^^} | Region: ${AWS_DEFAULT_REGION}"
+            echo "  Environment : ${ENV_NAME}"
+            echo "  Region      : ${AWS_DEFAULT_REGION}"
+            echo "  Cluster     : ${CLUSTER_NAME}"
             echo ""
-            
-            aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION} 2>/dev/null || true
-            ARGOCD_LB=$(kubectl get svc argocd-server -n argocd -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "Pending")
-            JENKINS_IP=$(aws ec2 describe-addresses --filters "Name=tag:Name,Values=wanderlust-${ENV_NAME}-cicd-eip" --query 'Addresses[0].PublicIp' --output text --region ${AWS_DEFAULT_REGION} 2>/dev/null || echo "Not found")
-            
-            echo "ArgoCD URL : https://$ARGOCD_LB"
-            echo "Jenkins URL: http://$JENKINS_IP:8080"
+            echo "  ArgoCD URL  : https://$ARGOCD_LB"
+            echo "  Jenkins URL : http://$JENKINS_IP:8080"
+            echo ""
             echo "✅ Deployment complete."
           '''
         }
