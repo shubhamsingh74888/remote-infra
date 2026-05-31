@@ -17,7 +17,6 @@ pipeline {
     terraform 'terraform-latest'
   }
 
-  // ── Dynamic Variables mapping from parameters ────────────
   environment {
     AWS_DEFAULT_REGION = "${params.AWS_REGION}"
     ENV_NAME           = "${params.ENVIRONMENT}"
@@ -26,9 +25,6 @@ pipeline {
     BACKEND_CONFIG     = "backend-configs/${params.ENVIRONMENT}.hcl"
     INFRA_REPO         = "${params.INFRA_REPO_URL}"
     PROJECT_REPO       = "${params.PROJECT_REPO_URL}"
-    // Always include /usr/local/bin first — this is what Jenkins daemon
-    // inherits. Combined with the systemd override.conf in the AMI,
-    // kubectl/helm/terraform are ALWAYS resolvable.
     PATH               = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${env.PATH}"
   }
 
@@ -363,7 +359,6 @@ Region:  ${env.AWS_DEFAULT_REGION}""",
           passwordVariable: 'AWS_SECRET_ACCESS_KEY'
         )]) {
           sh '''
-            # ── Always set full PATH first ──────────────────────────────
             export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
 
             echo "[BOOTSTRAP] Checking EKS cluster status..."
@@ -384,54 +379,56 @@ Region:  ${env.AWS_DEFAULT_REGION}""",
               --name ${CLUSTER_NAME} \
               --region ${AWS_DEFAULT_REGION}
 
-            # ── kubectl self-heal ───────────────────────────────────────
-            # Order of checks:
-            #   1. Already in PATH            → use it, done
-            #   2. Exists at /usr/local/bin   → fix PATH, done
-            #   3. Exists at /usr/bin         → fix PATH, done
-            #   4. Truly missing              → download to /tmp (no root needed)
-            #
-            # NEVER use: install -o root -g root  (requires root, Jenkins has none)
+            # ── kubectl resolution ──────────────────────────────────────
+            # Check actual binary paths directly — never rely on PATH or
+            # command -v (both are unreliable in Jenkins daemon shell mode).
+            # Never use: install -o root -g root (Jenkins has no root).
+            # Fallback always downloads to /tmp — zero permissions needed.
+            KUBECTL_BIN=""
 
-            if command -v kubectl &>/dev/null; then
-              echo "[BOOTSTRAP] ✔ kubectl in PATH: $(which kubectl)"
-
-            elif [ -f /usr/local/bin/kubectl ]; then
-              echo "[BOOTSTRAP] kubectl at /usr/local/bin but not in PATH — fixing"
-              export PATH=/usr/local/bin:$PATH
-
-            elif [ -f /usr/bin/kubectl ]; then
-              echo "[BOOTSTRAP] kubectl at /usr/bin but not in PATH — fixing"
-              export PATH=/usr/bin:$PATH
-
+            if   [ -x /usr/local/bin/kubectl   ]; then
+              KUBECTL_BIN=/usr/local/bin/kubectl
+              echo "[BOOTSTRAP] Found kubectl at /usr/local/bin/kubectl"
+            elif [ -x /usr/bin/kubectl         ]; then
+              KUBECTL_BIN=/usr/bin/kubectl
+              echo "[BOOTSTRAP] Found kubectl at /usr/bin/kubectl"
+            elif [ -x /tmp/kubectl-bin/kubectl ]; then
+              KUBECTL_BIN=/tmp/kubectl-bin/kubectl
+              echo "[BOOTSTRAP] Found kubectl at /tmp/kubectl-bin/kubectl (cached)"
             else
-              echo "[BOOTSTRAP] kubectl not found anywhere — downloading to /tmp/kubectl-bin"
+              echo "[BOOTSTRAP] kubectl not found in any known location."
+              echo "[BOOTSTRAP] /usr/local/bin contents:"
+              ls -la /usr/local/bin/ || true
+              echo "[BOOTSTRAP] Downloading kubectl v1.30.0 to /tmp/kubectl-bin ..."
               mkdir -p /tmp/kubectl-bin
               curl -fsSL \
                 "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl" \
                 -o /tmp/kubectl-bin/kubectl
               chmod +x /tmp/kubectl-bin/kubectl
-              export PATH=/tmp/kubectl-bin:$PATH
-              echo "[BOOTSTRAP] ✔ kubectl downloaded"
+              KUBECTL_BIN=/tmp/kubectl-bin/kubectl
+              echo "[BOOTSTRAP] ✔ kubectl downloaded successfully"
             fi
 
-            # Hard-fail with diagnostics if still missing after all checks
-            if ! command -v kubectl &>/dev/null; then
-              echo "[BOOTSTRAP] ✘ FATAL: kubectl not available. Diagnostics:"
-              echo "  PATH=$PATH"
-              echo "  /usr/local/bin:"; ls -la /usr/local/bin/ 2>/dev/null || true
-              echo "  /usr/bin/kubectl:"; ls -la /usr/bin/kubectl 2>/dev/null || true
+            # Prepend the directory containing kubectl to PATH
+            export PATH=$(dirname "$KUBECTL_BIN"):$PATH
+
+            # Hard-fail with full diagnostics if still not executable
+            if [ ! -x "$KUBECTL_BIN" ]; then
+              echo "[BOOTSTRAP] ✘ FATAL: kubectl binary not executable at: $KUBECTL_BIN"
+              ls -la "$KUBECTL_BIN" || true
               exit 1
             fi
 
-            echo "[BOOTSTRAP] kubectl version: $(kubectl version --client --short 2>/dev/null || kubectl version --client)"
+            echo "[BOOTSTRAP] kubectl binary: $KUBECTL_BIN"
+            echo "[BOOTSTRAP] kubectl version: $($KUBECTL_BIN version --client --short 2>/dev/null || $KUBECTL_BIN version --client)"
 
             echo "[BOOTSTRAP] Waiting for nodes to be Ready (up to 300s)..."
-            kubectl wait --for=condition=Ready nodes --all --timeout=300s || true
+            $KUBECTL_BIN wait --for=condition=Ready nodes --all --timeout=300s || true
 
             echo "[BOOTSTRAP] Running GitOps bootstrap script..."
             chmod +x bootstrap-gitops.sh
-            ./bootstrap-gitops.sh
+            # Pass the resolved kubectl path into bootstrap-gitops.sh
+            KUBECTL_PATH="$KUBECTL_BIN" ./bootstrap-gitops.sh
 
             echo "[BOOTSTRAP] ✔ ArgoCD + GitOps bootstrap complete."
           '''
@@ -481,7 +478,16 @@ Region:  ${env.AWS_DEFAULT_REGION}""",
                   --nodegroup-name "$NODEGROUP" \
                   --scaling-config minSize=1,maxSize=3,desiredSize=2 \
                   --region ${AWS_DEFAULT_REGION} 2>/dev/null || true
-                kubectl wait --for=condition=Ready nodes --all --timeout=300s || true
+
+                # resolve kubectl for wait command
+                KUBECTL_BIN=""
+                if   [ -x /usr/local/bin/kubectl   ]; then KUBECTL_BIN=/usr/local/bin/kubectl
+                elif [ -x /usr/bin/kubectl         ]; then KUBECTL_BIN=/usr/bin/kubectl
+                elif [ -x /tmp/kubectl-bin/kubectl ]; then KUBECTL_BIN=/tmp/kubectl-bin/kubectl
+                fi
+                if [ -n "$KUBECTL_BIN" ]; then
+                  $KUBECTL_BIN wait --for=condition=Ready nodes --all --timeout=300s || true
+                fi
               else
                 echo "[SCALE] ✔ Already have $CURRENT_DESIRED nodes — no scaling needed."
               fi
@@ -509,9 +515,19 @@ Region:  ${env.AWS_DEFAULT_REGION}""",
               --name ${CLUSTER_NAME} \
               --region ${AWS_DEFAULT_REGION} 2>/dev/null || true
 
-            ARGOCD_LB=$(kubectl get svc argocd-server -n argocd \
-              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' \
-              2>/dev/null || echo "Pending")
+            # resolve kubectl
+            KUBECTL_BIN=""
+            if   [ -x /usr/local/bin/kubectl   ]; then KUBECTL_BIN=/usr/local/bin/kubectl
+            elif [ -x /usr/bin/kubectl         ]; then KUBECTL_BIN=/usr/bin/kubectl
+            elif [ -x /tmp/kubectl-bin/kubectl ]; then KUBECTL_BIN=/tmp/kubectl-bin/kubectl
+            fi
+
+            ARGOCD_LB="Pending"
+            if [ -n "$KUBECTL_BIN" ]; then
+              ARGOCD_LB=$($KUBECTL_BIN get svc argocd-server -n argocd \
+                -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' \
+                2>/dev/null || echo "Pending")
+            fi
 
             JENKINS_IP=$(aws ec2 describe-addresses \
               --filters "Name=tag:Name,Values=wanderlust-${ENV_NAME}-cicd-eip" \
