@@ -1,4 +1,4 @@
-// ============================================================
+i// ============================================================
 //  Jenkinsfile  →  remote-infra/Jenkinsfile
 //
 //  Infrastructure Pipeline — Terraform S3/DynamoDB bootstrap
@@ -26,6 +26,9 @@ pipeline {
     BACKEND_CONFIG     = "backend-configs/${params.ENVIRONMENT}.hcl"
     INFRA_REPO         = "${params.INFRA_REPO_URL}"
     PROJECT_REPO       = "${params.PROJECT_REPO_URL}"
+    // Always include /usr/local/bin first — this is what Jenkins daemon
+    // inherits. Combined with the systemd override.conf in the AMI,
+    // kubectl/helm/terraform are ALWAYS resolvable.
     PATH               = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${env.PATH}"
   }
 
@@ -151,7 +154,6 @@ pipeline {
               export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
               rm -f tfplan
 
-              # Define dynamic resource names based on environment
               ROLE_NAME="wanderlust-${ENV_NAME}-jenkins-role"
               PROFILE_NAME="wanderlust-${ENV_NAME}-jenkins-profile"
               CUSTOM_POLICY="${ROLE_NAME}:wanderlust-${ENV_NAME}-jenkins-custom"
@@ -176,30 +178,39 @@ pipeline {
 
               echo "[RECONCILE] Checking IAM policy attachments..."
               terraform state show 'module.cicd_server.aws_iam_role_policy_attachment.ssm' > /dev/null 2>&1 || \
-              terraform import -var-file="${TF_VAR_FILE}" 'module.cicd_server.aws_iam_role_policy_attachment.ssm' "$ROLE_NAME/arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" || true
+              terraform import -var-file="${TF_VAR_FILE}" \
+                'module.cicd_server.aws_iam_role_policy_attachment.ssm' \
+                "$ROLE_NAME/arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" || true
 
               terraform state show 'module.cicd_server.aws_iam_role_policy_attachment.ecr' > /dev/null 2>&1 || \
-              terraform import -var-file="${TF_VAR_FILE}" 'module.cicd_server.aws_iam_role_policy_attachment.ecr' "$ROLE_NAME/arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess" || true
+              terraform import -var-file="${TF_VAR_FILE}" \
+                'module.cicd_server.aws_iam_role_policy_attachment.ecr' \
+                "$ROLE_NAME/arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess" || true
 
               echo "[RECONCILE] Checking EC2 instance ($SERVER_TAG)..."
               INSTANCE_ID=$(aws ec2 describe-instances \
-                --filters "Name=tag:Name,Values=$SERVER_TAG" "Name=instance-state-name,Values=running,stopped" \
-                --query 'Reservations[0].Instances[0].InstanceId' --output text --region ${AWS_DEFAULT_REGION} 2>/dev/null || echo "")
+                --filters "Name=tag:Name,Values=$SERVER_TAG" \
+                          "Name=instance-state-name,Values=running,stopped" \
+                --query 'Reservations[0].Instances[0].InstanceId' \
+                --output text --region ${AWS_DEFAULT_REGION} 2>/dev/null || echo "")
 
               if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
                 terraform state show 'module.cicd_server.aws_instance.cicd' > /dev/null 2>&1 || \
-                terraform import -var-file="${TF_VAR_FILE}" 'module.cicd_server.aws_instance.cicd' "$INSTANCE_ID" || true
+                terraform import -var-file="${TF_VAR_FILE}" \
+                  'module.cicd_server.aws_instance.cicd' "$INSTANCE_ID" || true
                 echo "[RECONCILE] ✔ EC2 instance $INSTANCE_ID reconciled."
               fi
 
               echo "[RECONCILE] Checking EIP ($EIP_TAG)..."
               EIP_ALLOC=$(aws ec2 describe-addresses \
                 --filters "Name=tag:Name,Values=$EIP_TAG" \
-                --query 'Addresses[0].AllocationId' --output text --region ${AWS_DEFAULT_REGION} 2>/dev/null || echo "")
+                --query 'Addresses[0].AllocationId' \
+                --output text --region ${AWS_DEFAULT_REGION} 2>/dev/null || echo "")
 
               if [ -n "$EIP_ALLOC" ] && [ "$EIP_ALLOC" != "None" ]; then
                 terraform state show 'module.cicd_server.aws_eip.cicd' > /dev/null 2>&1 || \
-                terraform import -var-file="${TF_VAR_FILE}" 'module.cicd_server.aws_eip.cicd' "$EIP_ALLOC" || true
+                terraform import -var-file="${TF_VAR_FILE}" \
+                  'module.cicd_server.aws_eip.cicd' "$EIP_ALLOC" || true
                 echo "[RECONCILE] ✔ EIP $EIP_ALLOC reconciled."
               fi
 
@@ -217,7 +228,8 @@ pipeline {
               elif [ $PLAN_EXIT -eq 0 ]; then
                 echo "[PLAN] ✔ No infrastructure changes needed."
               else
-                PLAN_SUMMARY=$(terraform show -no-color tfplan | grep -E '^Plan:|^No changes' || echo "Changes pending")
+                PLAN_SUMMARY=$(terraform show -no-color tfplan \
+                  | grep -E '^Plan:|^No changes' || echo "Changes pending")
                 echo "[PLAN] ✔ Changes detected: $PLAN_SUMMARY"
                 echo "$PLAN_SUMMARY" > /tmp/plan-summary.txt
               fi
@@ -236,7 +248,10 @@ pipeline {
         script {
           def planSummary = "No plan summary file found."
           try {
-            planSummary = sh(script: "cat /tmp/plan-summary.txt 2>/dev/null || echo 'No changes or plan-only run'", returnStdout: true).trim()
+            planSummary = sh(
+              script: "cat /tmp/plan-summary.txt 2>/dev/null || echo 'No changes or plan-only run'",
+              returnStdout: true
+            ).trim()
           } catch (ignored) {}
 
           timeout(time: 15, unit: 'MINUTES') {
@@ -298,9 +313,11 @@ Region:  ${env.AWS_DEFAULT_REGION}""",
           sh '''
             export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
             echo "[CLEANUP] Cleaning up before destroy..."
-            aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION} 2>/dev/null || true
+            aws eks update-kubeconfig \
+              --name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION} 2>/dev/null || true
             kubectl delete application --all -n argocd --timeout=60s 2>/dev/null || true
-            kubectl delete svc -n wanderlust --field-selector spec.type=LoadBalancer --timeout=120s 2>/dev/null || true
+            kubectl delete svc -n wanderlust \
+              --field-selector spec.type=LoadBalancer --timeout=120s 2>/dev/null || true
             echo "[CLEANUP] ✔ Pre-destroy cleanup complete."
             sleep 30
           '''
@@ -346,9 +363,10 @@ Region:  ${env.AWS_DEFAULT_REGION}""",
           passwordVariable: 'AWS_SECRET_ACCESS_KEY'
         )]) {
           sh '''
-            export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
-            echo "[BOOTSTRAP] Checking EKS cluster status..."
+            # ── Always set full PATH first ──────────────────────────────
+            export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
 
+            echo "[BOOTSTRAP] Checking EKS cluster status..."
             STATUS=$(aws eks describe-cluster \
               --name ${CLUSTER_NAME} \
               --region ${AWS_DEFAULT_REGION} \
@@ -362,19 +380,53 @@ Region:  ${env.AWS_DEFAULT_REGION}""",
             fi
 
             echo "[BOOTSTRAP] Updating kubeconfig..."
-            aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION}
+            aws eks update-kubeconfig \
+              --name ${CLUSTER_NAME} \
+              --region ${AWS_DEFAULT_REGION}
 
-            # Self-heal kubectl if missing (fallback for old AMI)
-            if ! command -v kubectl &>/dev/null; then
-              echo "[BOOTSTRAP] kubectl missing — installing..."
-              curl -fsSL "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl" -o /tmp/kubectl
-              install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
-              ln -sf /usr/local/bin/kubectl /usr/bin/kubectl
-              rm -f /tmp/kubectl
-              echo "[BOOTSTRAP] ✔ kubectl ready"
+            # ── kubectl self-heal ───────────────────────────────────────
+            # Order of checks:
+            #   1. Already in PATH            → use it, done
+            #   2. Exists at /usr/local/bin   → fix PATH, done
+            #   3. Exists at /usr/bin         → fix PATH, done
+            #   4. Truly missing              → download to /tmp (no root needed)
+            #
+            # NEVER use: install -o root -g root  (requires root, Jenkins has none)
+
+            if command -v kubectl &>/dev/null; then
+              echo "[BOOTSTRAP] ✔ kubectl in PATH: $(which kubectl)"
+
+            elif [ -f /usr/local/bin/kubectl ]; then
+              echo "[BOOTSTRAP] kubectl at /usr/local/bin but not in PATH — fixing"
+              export PATH=/usr/local/bin:$PATH
+
+            elif [ -f /usr/bin/kubectl ]; then
+              echo "[BOOTSTRAP] kubectl at /usr/bin but not in PATH — fixing"
+              export PATH=/usr/bin:$PATH
+
+            else
+              echo "[BOOTSTRAP] kubectl not found anywhere — downloading to /tmp/kubectl-bin"
+              mkdir -p /tmp/kubectl-bin
+              curl -fsSL \
+                "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl" \
+                -o /tmp/kubectl-bin/kubectl
+              chmod +x /tmp/kubectl-bin/kubectl
+              export PATH=/tmp/kubectl-bin:$PATH
+              echo "[BOOTSTRAP] ✔ kubectl downloaded"
             fi
 
-            echo "[BOOTSTRAP] Waiting for nodes to be Ready..."
+            # Hard-fail with diagnostics if still missing after all checks
+            if ! command -v kubectl &>/dev/null; then
+              echo "[BOOTSTRAP] ✘ FATAL: kubectl not available. Diagnostics:"
+              echo "  PATH=$PATH"
+              echo "  /usr/local/bin:"; ls -la /usr/local/bin/ 2>/dev/null || true
+              echo "  /usr/bin/kubectl:"; ls -la /usr/bin/kubectl 2>/dev/null || true
+              exit 1
+            fi
+
+            echo "[BOOTSTRAP] kubectl version: $(kubectl version --client --short 2>/dev/null || kubectl version --client)"
+
+            echo "[BOOTSTRAP] Waiting for nodes to be Ready (up to 300s)..."
             kubectl wait --for=condition=Ready nodes --all --timeout=300s || true
 
             echo "[BOOTSTRAP] Running GitOps bootstrap script..."
