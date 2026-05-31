@@ -1,4 +1,4 @@
-i// ============================================================
+// ============================================================
 //  Jenkinsfile  →  remote-infra/Jenkinsfile
 //
 //  Infrastructure Pipeline — Terraform S3/DynamoDB bootstrap
