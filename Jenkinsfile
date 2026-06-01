@@ -1,5 +1,5 @@
 // ============================================================
-//  Jenkinsfile  →  remote-infra/Jenkinsfile
+//  Jenkinsfile    remote-infra/Jenkinsfile
 //
 //  Infrastructure Pipeline — Terraform S3/DynamoDB bootstrap
 //  THEN EKS + Jenkins EC2 + ArgoCD via Wanderlust-Mega-Project/terraform
