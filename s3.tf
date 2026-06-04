@@ -9,7 +9,7 @@
 
 
 resource "aws_s3_bucket" "my_s3_bucket" {
-  bucket = "my-s3-bucket-shubham-${terraform.workspace}"
+  bucket = "my-s3-bucket-shubhamsingh${terraform.workspace}"
 
   tags = {
     Name        = "wanderlust-s3-${terraform.workspace}"
